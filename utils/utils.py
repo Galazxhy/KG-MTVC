@@ -4,8 +4,15 @@ import torch.nn.functional as F
 from einops import rearrange
 from math import exp
 from config import config
-from torch.utils.data import random_split, DataLoader
-from data.dataset import Zinc_Dataset, HMDB_Dataset
+from torch.utils.data import random_split, DataLoader, Subset
+from data.dataset import HMDB_Dataset
+from torchvision.transforms import (
+    Compose,
+    RandomResizedCrop,
+    RandomAffine,
+    RandomRotation,
+    RandomHorizontalFlip,
+)
 
 
 def log_results(result_dict):
@@ -19,25 +26,23 @@ def log_results(result_dict):
 
 
 def get_data():
-    if config.data_name == "Zinc":
-        dataset = Zinc_Dataset(config.data_root)
-    elif config.data_name == "HMDB":
+    if config.data_name == "HMDB":
         dataset = HMDB_Dataset(config.data_root)
+        trn_set, val_set, tst_set = random_split(
+            dataset,
+            [
+                round(0.6 * len(dataset)),
+                round(0.2 * len(dataset)),
+                len(dataset) - round(0.6 * len(dataset)) - round(0.2 * len(dataset)),
+            ],
+        )
 
-    trn_set, val_set, tst_set = random_split(
-        dataset,
-        [
-            round(0.6 * len(dataset)),
-            round(0.2 * len(dataset)),
-            len(dataset) - round(0.6 * len(dataset)) - round(0.2 * len(dataset)),
-        ],
-    )
     trn_loader = DataLoader(
         trn_set,
         batch_size=config.batch_size,
         shuffle=True,
         drop_last=False,
-        num_workers=8,
+        num_workers=16,
         pin_memory=True,
         prefetch_factor=2,
     )
@@ -46,7 +51,7 @@ def get_data():
         batch_size=config.batch_size,
         shuffle=True,
         drop_last=False,
-        num_workers=8,
+        num_workers=16,
         pin_memory=True,
         prefetch_factor=2,
     )
@@ -55,7 +60,7 @@ def get_data():
         batch_size=config.batch_size,
         shuffle=True,
         drop_last=False,
-        num_workers=8,
+        num_workers=16,
         pin_memory=True,
         prefetch_factor=2,
     )
@@ -147,7 +152,7 @@ class Cross_Attention(nn.Module):
         self.to_k = nn.Linear(dim, inner_dim, bias=False)
         self.to_v = nn.Linear(dim, inner_dim, bias=False)
 
-        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(0.5))
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(0.2))
 
     def forward(self, x, context):
         """
@@ -177,11 +182,10 @@ class Cross_Attention(nn.Module):
 
 class MultiLossLayer(nn.Module):
     """
-    计算自适应损失权重
     implementation of "Multi-Task Learning Using Uncertainty to Weigh Losses for Scene Geometry and Semantics"
     """
 
-    def __init__(self, num_loss):
+    def __init__(self, num_loss, init_log_sigma=0.0):
         """
         Args:
             num_loss (int): number of multi-task loss
@@ -189,32 +193,31 @@ class MultiLossLayer(nn.Module):
         super(MultiLossLayer, self).__init__()
         # sigmas^2 (num_loss,)
         # uniform init
-        # 从均匀分布U(a, b)中生成值，填充输入的张量或变量，其中a为均匀分布中的下界，b为均匀分布中的上界
-        self.sigmas_sq = nn.Parameter(
-            nn.init.uniform_(torch.empty(num_loss), a=0.2, b=1.0), requires_grad=True
+        self.log_sigma = nn.Parameter(
+            torch.ones(num_loss) * init_log_sigma,
+            requires_grad=True
         )
+        self.epsilon = 1e-6
 
-    def get_loss(self, loss_set):
+    def forward(self, loss_set):
         """
         Args:
             loss_set (Tensor): multi-task loss (num_loss,)
         """
         # 1/2σ^2
         # (num_loss,)
-        # self.sigmas_sq -> tensor([0.9004, 0.4505]) -> tensor([0.6517, 0.8004]) -> tensor([0.7673, 0.6247])
-        # 出现左右两个数随着迭代次数的增加，相对大小交替变换
-        factor = torch.div(1.0, torch.mul(2.0, self.sigmas_sq))
+        sigma = torch.exp(self.log_sigma) + self.epsilon
+        factor = 1.0 / (2.0 * sigma**2)
         # loss part (num_loss,)
         loss_part = torch.sum(torch.mul(factor, loss_set))
-        # regular part 正则项，防止某个σ过大而引起训练严重失衡。
-        regular_part = torch.sum(torch.log(self.sigmas_sq))
+        # regular part
+        regular_part = torch.sum(self.log_sigma)
 
         loss = loss_part + regular_part
 
         return loss
 
 
-# 计算一维高斯分布向量
 def gaussian(window_size, sigma):
     gauss = torch.Tensor(
         [
@@ -225,7 +228,6 @@ def gaussian(window_size, sigma):
     return gauss / gauss.sum()
 
 
-# 创建高斯核
 def create_window(window_size, channel=1):
     _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
     _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
@@ -233,7 +235,7 @@ def create_window(window_size, channel=1):
     return window
 
 
-# 计算SSIM
+# cal SSIM
 def ssim(
     img1,
     img2,
@@ -289,7 +291,7 @@ def ssim(
     return ret
 
 
-# SSIM类
+# SSIM
 class SSIM(torch.nn.Module):
     def __init__(self, window_size=11, size_average=True, val_range=None):
         super(SSIM, self).__init__()
@@ -318,3 +320,42 @@ class SSIM(torch.nn.Module):
             window_size=self.window_size,
             size_average=self.size_average,
         )
+
+
+def apply_same_transform(images, transform):
+    state = torch.get_rng_state()
+
+    if hasattr(transform, "randomize_parameters"):
+        transform.randomize_parameters(images[0])
+
+    transformed_images = []
+    for img in images:
+        if img != None:
+            torch.set_rng_state(state)
+            transformed_images.append(transform(img))
+
+    return transformed_images
+
+
+def transform_trn(spa_img, tem_flow, next_imgs=None):
+    trans = Compose(
+        [
+            RandomHorizontalFlip(p=0.5),
+            RandomRotation(degrees=20),
+            RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        ]
+    )
+    spa_imgs_trn = None
+    tem_flows_trn = None
+    next_imgs_trn = None
+    # for i in range(spa_img.shape[0]):
+    transformed_imgs = apply_same_transform([spa_img, tem_flow, next_imgs], trans)
+    # spa_imgs_trn = ts_append(spa_imgs_trn, transformed_imgs[0])
+    # tem_flows_trn = ts_append(tem_flows_trn, transformed_imgs[1])
+    # next_imgs_trn = ts_append(next_imgs_trn, transformed_imgs[2])
+
+    return (
+        transformed_imgs[0],
+        transformed_imgs[1],
+        transformed_imgs[2] if len(transformed_imgs) > 2 else None,
+    )

@@ -21,7 +21,7 @@ class TS_AE(nn.Module):
         super(TS_AE, self).__init__()
         spa_out = nn.Linear(512, latent_dim)
 
-        self.spatial_enc = models.resnet18(
+        self.spatial_enc = models.resnet34(
             weights=models.ResNet18_Weights.IMAGENET1K_V1
         )
         # print(self.spatial_enc)
@@ -30,7 +30,7 @@ class TS_AE(nn.Module):
             2, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
         )
         tem_out = nn.Linear(512, latent_dim)
-        self.temporal_enc = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.temporal_enc = models.resnet34(weights=models.ResNet18_Weights.DEFAULT)
         self.temporal_enc.conv1 = conv1
         self.temporal_enc.fc = tem_out
 

@@ -110,7 +110,7 @@ class MC_FRGE(torch.nn.Module):
         ]
 
         adj_crucial = [
-            sum(torch.logical_and(a, b)) != 0
+            sum(torch.logical_and(a, b)) / len(label_class)
             for a in crucial_multihot
             for b in crucial_multihot
         ]
